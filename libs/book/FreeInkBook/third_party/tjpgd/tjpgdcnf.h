@@ -24,7 +24,7 @@
 /  1: Enable
 */
 
-#define JD_FASTDECODE	1 /* FreeInkBook: 32-bit MCU tables */
+#define JD_FASTDECODE	0 /* Use portable Huffman path; avoids fast-path grayscale artifacts */
 /* Optimization level
 /  0: Basic optimization. Suitable for 8/16-bit MCUs.
 /  1: + 32-bit barrel shifter. Suitable for 32-bit MCUs.
