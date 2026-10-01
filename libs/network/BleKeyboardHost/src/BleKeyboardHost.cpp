@@ -11,6 +11,10 @@
 
 #include <BoardConfig.h>  // FREEINK_CAP_BLE_HID_HOST
 
+#ifndef FREEINK_BLE_HID_LIFECYCLE_DIAGNOSTICS
+#define FREEINK_BLE_HID_LIFECYCLE_DIAGNOSTICS 0
+#endif
+
 namespace freeink {
 
 BleKeyboardHost& BleKeyboardHost::getInstance() {
@@ -50,6 +54,22 @@ constexpr uint32_t kConnectTimeoutMs = 8000;
 constexpr uint32_t kTeardownConnectWaitMs = kConnectTimeoutMs + 500;
 constexpr size_t kScanDebugPayloadMax = 31;
 
+void lifecycleStage(const char* stage) {
+#if FREEINK_BLE_HID_LIFECYCLE_DIAGNOSTICS
+  if (!stage || (std::strcmp(stage, "pre_init") != 0 && std::strcmp(stage, "nimble_init") != 0 &&
+                 std::strcmp(stage, "client_created") != 0 && std::strcmp(stage, "host_ready") != 0 &&
+                 std::strcmp(stage, "connect_start") != 0 && std::strcmp(stage, "link_connected") != 0 &&
+                 std::strcmp(stage, "hid_service_found") != 0 && std::strcmp(stage, "security_ready") != 0 &&
+                 std::strcmp(stage, "hid_input_ready") != 0 && std::strcmp(stage, "scan_start") != 0))
+    return;
+  Serial.printf("[BLEMEM] stage=%s free=%lu largest=%lu\n", stage,
+                static_cast<unsigned long>(ESP.getFreeHeap()),
+                static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+#else
+  (void)stage;
+#endif
+}
+
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 
 NimBLEClient* g_client = nullptr;
@@ -76,6 +96,38 @@ bool g_hasConsumerPage = false;
 uint8_t g_preferredByteIndex = 0xFF;  // byte the report map suggests holds the code
 uint8_t g_lastGenericCode = 0;        // last non-zero code seen on the generic path
 volatile uint32_t g_lastReportMs = 0;  // millis() of the last HID notification (stale-release)
+
+enum class YiserGesture : uint8_t { Idle, PendingConfirm, Vertical, Left, Right, AwaitRelease };
+struct YiserGestureState {
+  YiserGesture kind = YiserGesture::Idle;
+  uint8_t step = 0;
+  uint16_t firstAxis = 0;
+  uint32_t startedMs = 0;
+};
+YiserGestureState g_yiserGesture;
+constexpr uint32_t kYiserGestureTimeoutMs = 350;
+
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+constexpr uint8_t kRawReportRingLen = 16;
+RawReportDiagnostic g_rawReports[kRawReportRingLen] = {};
+volatile uint8_t g_rawReportHead = 0;
+volatile uint8_t g_rawReportTail = 0;
+uint32_t g_rawReportSequence = 0;
+uint32_t g_lastRawReportMs = 0;
+
+void enqueueRawDiagnostic(const RawReportDiagnostic& raw) {
+  portENTER_CRITICAL(&g_mux);
+  const uint8_t next = static_cast<uint8_t>((g_rawReportHead + 1) % kRawReportRingLen);
+  if (next == g_rawReportTail) {
+    // Keep the newest reports; sequence gaps make any overflow visible in the
+    // physical capture without allowing the callback to block or allocate.
+    g_rawReportTail = static_cast<uint8_t>((g_rawReportTail + 1) % kRawReportRingLen);
+  }
+  g_rawReports[g_rawReportHead] = raw;
+  g_rawReportHead = next;
+  portEXIT_CRITICAL(&g_mux);
+}
+#endif
 
 BleKeyboardHost& self() { return BleKeyboardHost::getInstance(); }
 
@@ -148,8 +200,12 @@ void printPayloadHex(const NimBLEAdvertisedDevice* dev) {
 }
 #endif
 
-void onHidNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
-  self().onReportIngest(data, len);
+void onHidNotify(NimBLERemoteCharacteristic* characteristic, uint8_t* data, size_t len, bool) {
+  uint8_t source = 0;
+  if (characteristic) {
+    source = characteristic->getUUID() == NimBLEUUID(kCharBootKbdInput) ? 2 : 1;
+  }
+  self().onReportIngest(data, len, source);
 }
 
 bool setupHid(NimBLEClient* client) {
@@ -213,6 +269,11 @@ void doConnect(const char* addrStr, uint8_t type) {
   }
   NimBLEDevice::getScan()->stop();
   NimBLEAddress addr(std::string(addrStr), type);
+  if (!self().connectionPermitted()) {
+    self().onConnectionDeferred();
+    return;
+  }
+  lifecycleStage("connect_start");
   if (!g_client->connect(addr)) {
 #if FREEINK_BLE_HID_SCAN_DEBUG
     Serial.printf("[BleHid] connect failed: %s type=%u err=%d\n", addrStr, type, g_client->getLastError());
@@ -226,6 +287,10 @@ void doConnect(const char* addrStr, uint8_t type) {
     Serial.printf("[BleHid] retry connect: %s type=%u\n", addrStr, type);
 #endif
     addr = NimBLEAddress(std::string(addrStr), type);
+    if (!self().connectionPermitted()) {
+      self().onConnectionDeferred();
+      return;
+    }
     if (!g_client->connect(addr)) {
 #if FREEINK_BLE_HID_SCAN_DEBUG
       Serial.printf("[BleHid] connect failed: %s type=%u err=%d\n", addrStr, type, g_client->getLastError());
@@ -234,6 +299,7 @@ void doConnect(const char* addrStr, uint8_t type) {
       return;
     }
   }
+  lifecycleStage("link_connected");
   if (!hasHidService(g_client)) {
 #if FREEINK_BLE_HID_SCAN_DEBUG
     Serial.printf("[BleHid] no HID service: %s\n", addrStr);
@@ -242,7 +308,12 @@ void doConnect(const char* addrStr, uint8_t type) {
     self().onConnectFailed("Not a HID device");
     return;
   }
-  if (!g_client->secureConnection()) {
+  lifecycleStage("hid_service_found");
+  // A bonded reconnect may already be encrypted when connect() returns. Calling
+  // secureConnection() again in that state can turn a valid re-encryption into
+  // the observed "Pairing failed" path on older remotes.
+  const NimBLEConnInfo connectedInfo = g_client->getConnInfo();
+  if (!connectedInfo.isEncrypted() && !g_client->secureConnection()) {
 #if FREEINK_BLE_HID_SCAN_DEBUG
     Serial.printf("[BleHid] security failed: %s err=%d\n", addrStr, g_client->getLastError());
 #endif
@@ -250,6 +321,7 @@ void doConnect(const char* addrStr, uint8_t type) {
     self().onConnectFailed("Pairing failed");
     return;
   }
+  lifecycleStage("security_ready");
   if (!setupHid(g_client)) {
 #if FREEINK_BLE_HID_SCAN_DEBUG
     Serial.printf("[BleHid] HID setup failed: %s\n", addrStr);
@@ -258,7 +330,12 @@ void doConnect(const char* addrStr, uint8_t type) {
     self().onConnectFailed("No HID input report");
     return;
   }
-  self().onLinkUp(addrStr, nullptr, type);  // name resolved from scan/bond lists
+  lifecycleStage("hid_input_ready");
+  const NimBLEConnInfo securedInfo = g_client->getConnInfo();
+  const NimBLEAddress identity = securedInfo.getIdAddress();
+  const std::string identityString = identity.isNull() ? std::string() : identity.toString();
+  self().onLinkUp(addrStr, nullptr, type, identityString.empty() ? nullptr : identityString.c_str(),
+                  identity.getType());  // name resolved from scan/bond lists
 }
 
 void connTaskFn(void*) {
@@ -351,10 +428,12 @@ bool BleKeyboardHost::begin(const char* hostName) {
 #if FREEINK_BLE_HID_SCAN_DEBUG
   Serial.printf("[BleHid] begin: loaded bonds=%u\n", bondCount_);
 #endif
+  lifecycleStage("pre_init");
   if (!NimBLEDevice::init(hostName ? hostName : "FreeInk")) {
     Serial.println("[BleHid] begin: NimBLEDevice::init() failed");
     return false;
   }
+  lifecycleStage("nimble_init");
 
   // HID page-turner reports are a few bytes; request the minimum ATT MTU so the
   // host doesn't reserve large per-connection GATT buffers. On RAM-constrained
@@ -404,6 +483,7 @@ bool BleKeyboardHost::begin(const char* hostName) {
     NimBLEDevice::deinit(true);
     return false;
   }
+  lifecycleStage("client_created");
   g_client->setConnectTimeout(kConnectTimeoutMs);
   // Widen the link supervision timeout. The host runs on a single RISC-V core and
   // some operations block it for several seconds (e.g. the reader rebuilding a whole
@@ -420,6 +500,7 @@ bool BleKeyboardHost::begin(const char* hostName) {
 
   xTaskCreate(connTaskFn, "ble-conn", 4096, nullptr, 3, &g_connTask);
   begun_ = true;
+  lifecycleStage("host_ready");
 #if FREEINK_BLE_HID_SCAN_DEBUG
   Serial.println("[BleHid] begin: ok");
 #endif
@@ -429,6 +510,7 @@ bool BleKeyboardHost::begin(const char* hostName) {
 void BleKeyboardHost::end() {
   if (!begun_) return;
   begun_ = false;
+  lifecycleStage("host_end_pre");
 
   NimBLEScan* scan = NimBLEDevice::getScan();
   if (scan && scan->isScanning()) scan->stop();
@@ -476,9 +558,11 @@ void BleKeyboardHost::end() {
     vTaskDelay(pdMS_TO_TICKS(50));
     NimBLEDevice::deinit(true);
   }
+  lifecycleStage("host_end_post");
   g_connecting = false;
   g_lastGenericCode = 0;
   g_lastReportMs = 0;
+  resetPresetState();
 
   portENTER_CRITICAL(&g_mux);
   connected_ = false;
@@ -515,6 +599,7 @@ void BleKeyboardHost::poll() {
 
   // Auto-reconnect to a bonded HID peripheral.
   if (!connected_ && !g_connecting && !scanning_ && bondCount_ > 0) {
+    if (connectionPermission_ && !connectionPermission_()) return;
     const uint32_t now = millis();
     if (now - g_lastReconnectMs > kReconnectBackoffMs) {
       g_lastReconnectMs = now;
@@ -530,6 +615,12 @@ void BleKeyboardHost::startScan(uint32_t ms) {
   if (!begun_) {
 #if FREEINK_BLE_HID_SCAN_DEBUG
     Serial.println("[BleHid] scan start ignored: host not begun");
+#endif
+    return;
+  }
+  if (connectionPermission_ && !connectionPermission_()) {
+#if FREEINK_BLE_HID_SCAN_DEBUG
+    Serial.println("[BleHid] scan start denied by application");
 #endif
     return;
   }
@@ -554,6 +645,7 @@ void BleKeyboardHost::startScan(uint32_t ms) {
 #endif
   const bool started = scan->start(ms, false, true);
   scanning_ = scan->isScanning();
+  lifecycleStage("scan_start");
 #if FREEINK_BLE_HID_SCAN_DEBUG
   Serial.printf("[BleHid] scan start result: started=%d scanning=%d\n", started ? 1 : 0, scanning_ ? 1 : 0);
 #endif
@@ -584,6 +676,7 @@ void BleKeyboardHost::releaseScanResults() {
 // --- Connection --------------------------------------------------------------
 bool BleKeyboardHost::connect(const char* addr) {
   if (!begun_ || !addr || g_connecting) return false;
+  if (connectionPermission_ && !connectionPermission_()) return false;
 
   uint8_t type = 0;
   bool knownType = false;
@@ -650,6 +743,29 @@ bool BleKeyboardHost::popKey(KeyEvent& out) {
   return got;
 }
 
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+bool BleKeyboardHost::popRawReport(RawReportDiagnostic& out) {
+  bool got = false;
+  portENTER_CRITICAL(&g_mux);
+  if (g_rawReportHead != g_rawReportTail) {
+    out = g_rawReports[g_rawReportTail];
+    g_rawReportTail = static_cast<uint8_t>((g_rawReportTail + 1) % kRawReportRingLen);
+    got = true;
+  }
+  portEXIT_CRITICAL(&g_mux);
+  return got;
+}
+
+void BleKeyboardHost::clearRawReports() {
+  portENTER_CRITICAL(&g_mux);
+  g_rawReportHead = 0;
+  g_rawReportTail = 0;
+  g_rawReportSequence = 0;
+  g_lastRawReportMs = 0;
+  portEXIT_CRITICAL(&g_mux);
+}
+#endif
+
 void BleKeyboardHost::enqueue(const KeyEvent& ev) {
   portENTER_CRITICAL(&g_mux);
   const uint8_t next = static_cast<uint8_t>((ringHead_ + 1) % kKeyQueueLen);
@@ -677,10 +793,150 @@ void BleKeyboardHost::emitUsage(uint8_t usage, uint8_t mods) {
   enqueue(ev);
 }
 
+void BleKeyboardHost::emitSpecial(const SpecialKey special) {
+  if (special == SpecialKey::None) return;
+  KeyEvent ev;
+  ev.special = special;
+  ev.pressed = true;
+  enqueue(ev);
+}
+
+void BleKeyboardHost::resetPresetState() { g_yiserGesture = YiserGestureState{}; }
+
+void BleKeyboardHost::processYiserReport(const uint8_t* data, const size_t len) {
+  if (!data || len < 5) return;
+  const uint32_t now = millis();
+  // Standalone Confirm is emitted on its release report.  Do not discard that
+  // pending state merely because the user held the ring for longer than the
+  // directional-burst recognition window; the next report is still bounded
+  // and PendingConfirm itself decides whether it is the matching release or
+  // the beginning of a directional gesture.  Directional states retain the
+  // short timeout so a partial burst cannot remain active indefinitely.
+  if (g_yiserGesture.kind != YiserGesture::Idle && g_yiserGesture.kind != YiserGesture::PendingConfirm &&
+      now - g_yiserGesture.startedMs > kYiserGestureTimeoutMs) {
+    resetPresetState();
+  }
+
+  const uint8_t status = data[0];
+  const uint8_t code = data[1];
+  uint16_t axis = 0;
+  memcpy(&axis, data + 3, sizeof(axis));  // HID payload may be unaligned.
+  const bool pressed = status != 0;
+
+  constexpr uint8_t kVertical[] = {0x2C, 0x18, 0x2C, 0x18, 0x2C, 0x18, 0x22};
+  constexpr uint8_t kLeft[] = {0x96, 0xC8, 0xFA, 0x2C, 0x5E, 0x90, 0xC2};
+  constexpr uint8_t kRight[] = {0x90, 0x5E, 0x2C, 0xC8, 0x96, 0x64, 0x32};
+
+  switch (g_yiserGesture.kind) {
+    case YiserGesture::Idle:
+      if (!pressed) return;
+      if (code == 0xA4) {
+        emitSpecial(SpecialKey::Escape);  // Back
+        return;
+      }
+      if (code == 0x2C) {
+        // Confirm is delayed until the matching release. The same 0x2C code is
+        // the first and fourth member of the directional ring gestures.
+        g_yiserGesture.kind = YiserGesture::PendingConfirm;
+        g_yiserGesture.step = 1;
+        g_yiserGesture.firstAxis = axis;
+        g_yiserGesture.startedMs = now;
+        return;
+      }
+      if (code == kLeft[0]) {
+        g_yiserGesture.kind = YiserGesture::Left;
+        g_yiserGesture.step = 1;
+        g_yiserGesture.startedMs = now;
+        return;
+      }
+      if (code == kRight[0]) {
+        g_yiserGesture.kind = YiserGesture::Right;
+        g_yiserGesture.step = 1;
+        g_yiserGesture.startedMs = now;
+      }
+      return;
+
+    case YiserGesture::PendingConfirm:
+      if (!pressed) {
+        if (code == 0x2C && axis == 0x01F4) emitSpecial(SpecialKey::Enter);  // Confirm
+        resetPresetState();
+        return;
+      }
+      // Directional bursts never use the standalone Confirm axis value.
+      if (code == 0x18 || (code == 0x2C && axis != 0x01F4)) {
+        g_yiserGesture.kind = YiserGesture::Vertical;
+        g_yiserGesture.step = 2;
+        g_yiserGesture.startedMs = now;
+        return;
+      }
+      resetPresetState();
+      return;
+
+    case YiserGesture::Vertical:
+      if (!pressed || g_yiserGesture.step >= sizeof(kVertical) || code != kVertical[g_yiserGesture.step]) {
+        resetPresetState();
+        return;
+      }
+      ++g_yiserGesture.step;
+      if (g_yiserGesture.step == sizeof(kVertical)) {
+        emitSpecial(g_yiserGesture.firstAxis >= 0x0200 ? SpecialKey::Down : SpecialKey::Up);
+        g_yiserGesture.kind = YiserGesture::AwaitRelease;
+      }
+      return;
+
+    case YiserGesture::Left:
+      if (!pressed || g_yiserGesture.step >= sizeof(kLeft) || code != kLeft[g_yiserGesture.step]) {
+        resetPresetState();
+        return;
+      }
+      ++g_yiserGesture.step;
+      if (g_yiserGesture.step == sizeof(kLeft)) {
+        emitSpecial(SpecialKey::Left);
+        g_yiserGesture.kind = YiserGesture::AwaitRelease;
+      }
+      return;
+
+    case YiserGesture::Right:
+      if (!pressed || g_yiserGesture.step >= sizeof(kRight) || code != kRight[g_yiserGesture.step]) {
+        resetPresetState();
+        return;
+      }
+      ++g_yiserGesture.step;
+      if (g_yiserGesture.step == sizeof(kRight)) {
+        emitSpecial(SpecialKey::Right);
+        g_yiserGesture.kind = YiserGesture::AwaitRelease;
+      }
+      return;
+
+    case YiserGesture::AwaitRelease:
+      if (!pressed) resetPresetState();
+      return;
+  }
+}
+
 // --- Internal hooks from the BLE backend -------------------------------------
-void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len) {
+void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len, const uint8_t source) {
   if (!data || len == 0) return;
-  g_lastReportMs = millis();  // freshness for the stale-release timeout in poll()
+  const uint32_t reportMs = millis();
+  g_lastReportMs = reportMs;  // freshness for the stale-release timeout in poll()
+
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+  RawReportDiagnostic raw;
+  raw.sequence = ++g_rawReportSequence;
+  raw.uptimeMs = reportMs;
+  const uint32_t delta = g_lastRawReportMs == 0 ? 0 : reportMs - g_lastRawReportMs;
+  raw.deltaMs = delta > 0xFFFFu ? 0xFFFFu : static_cast<uint16_t>(delta);
+  g_lastRawReportMs = reportMs;
+  raw.source = source;
+  raw.reportType = 1;  // setupHid subscribes only to HID input reports.
+  raw.reportId = source == 1 && len == 9 ? data[0] : 0xFF;
+  raw.length = len > 0xFFFFu ? 0xFFFF : static_cast<uint16_t>(len);
+  raw.storedLength = len > RawReportDiagnostic::kMaxPayloadBytes
+                         ? RawReportDiagnostic::kMaxPayloadBytes
+                         : static_cast<uint8_t>(len);
+  raw.truncated = len > RawReportDiagnostic::kMaxPayloadBytes;
+  memcpy(raw.payload, data, raw.storedLength);
+#endif
 
 #if FREEINK_BLE_HID_REPORT_DEBUG
   {
@@ -703,6 +959,14 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len) {
     n -= 1;
   }
 
+  if (inputPreset_ == InputPreset::YiserJ6Ring) {
+    processYiserReport(p, n);
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+    enqueueRawDiagnostic(raw);
+#endif
+    return;
+  }
+
   // --- Standard keyboard report path -----------------------------------------
   uint8_t mod = 0;
   uint8_t keys[6] = {0};
@@ -719,6 +983,9 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len) {
 
   bool emittedKb = false;
   if (keyboardShaped) {
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+    raw.state |= RAW_STATE_KEYBOARD_SHAPED;
+#endif
     // Emit a press for every key newly present versus the previous report.
     for (int i = 0; i < 6; ++i) {
       const uint8_t k = keys[i];
@@ -741,6 +1008,10 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len) {
     for (int i = 0; i < 6; ++i) {
       if (keys[i] != 0 && keys[i] != 0x01) cur = keys[i];
     }
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+    if (cur == 0) raw.state |= RAW_STATE_RELEASE_EDGE;
+    if (emittedKb) raw.state |= RAW_STATE_PRESS_EDGE;
+#endif
     portENTER_CRITICAL(&g_mux);
     if (cur == 0) {
       heldUsage_ = 0;
@@ -762,6 +1033,9 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len) {
   // representative code and surface it (edge-detected so one press == one event).
   const bool tryGeneric = !emittedKb && (g_hasConsumerPage || !g_hasKeyboardPage || n < 7);
   if (tryGeneric) {
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+    raw.state |= RAW_STATE_GENERIC_PATH;
+#endif
     size_t codeIdx = 0;
     const uint8_t code = extractPrimaryCode(p, n, &codeIdx);
     // Gamepad-style modes keep constant bits in the button byte and only clear
@@ -775,6 +1049,11 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len) {
     // human-separated presses.
     const bool pressEdge = code != 0 && code != g_lastGenericCode && (code & ~g_lastGenericCode) != 0;
     const bool releaseEdge = code != 0 && code != g_lastGenericCode && (code & ~g_lastGenericCode) == 0;
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+    if (code == 0 || releaseEdge) raw.state |= RAW_STATE_RELEASE_EDGE;
+    if (pressEdge) raw.state |= RAW_STATE_PRESS_EDGE;
+    if (codeIdx == 0 && n >= 5) raw.state |= RAW_STATE_AXIS_CANDIDATE;
+#endif
     if (codeIdx == 0 && n >= 5) {
       // Gamepad/axis-pair mode (ino gamebrick T): byte 0 is a status byte whose
       // bit0 is "pressed" (0x13 press -> 0x12 release), bytes 1-4 are two 16-bit
@@ -812,6 +1091,10 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len) {
   } else if (emittedKb) {
     g_lastGenericCode = 0;
   }
+
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+  enqueueRawDiagnostic(raw);
+#endif
 }
 
 void BleKeyboardHost::onScanResultIngest(const char* addr, const char* name, int rssi, uint8_t type, bool hid,
@@ -890,60 +1173,88 @@ void BleKeyboardHost::onScanResultIngest(const char* addr, const char* name, int
   portEXIT_CRITICAL(&g_mux);
 }
 
-void BleKeyboardHost::onLinkUp(const char* addr, const char* name, uint8_t type) {
+void BleKeyboardHost::onLinkUp(const char* addr, const char* name, uint8_t type, const char* identityAddr,
+                               const uint8_t identityType) {
   // Resolve a friendly name from the scan or bond lists if the caller has none.
   const char* resolved = (name && name[0] && (!addr || strcmp(name, addr) != 0)) ? name : nullptr;
-  if (!resolved && addr) {
+  const char* lookupAddresses[2] = {addr, identityAddr};
+  for (const char* lookup : lookupAddresses) {
+    if (resolved || !lookup || !lookup[0]) continue;
     for (uint8_t i = 0; i < deviceCount_; ++i) {
-      if (strncmp(devices_[i].addr, addr, sizeof(devices_[i].addr)) == 0 && devices_[i].hasName &&
-          devices_[i].name[0] && strcmp(devices_[i].name, addr) != 0) {
+      if (strncmp(devices_[i].addr, lookup, sizeof(devices_[i].addr)) == 0 && devices_[i].hasName &&
+          devices_[i].name[0] && strcmp(devices_[i].name, lookup) != 0) {
         resolved = devices_[i].name;
         break;
       }
     }
   }
-  if (!resolved && addr) {
+  for (const char* lookup : lookupAddresses) {
+    if (resolved || !lookup || !lookup[0]) continue;
     for (uint8_t i = 0; i < bondCount_; ++i) {
-      if (strncmp(bonds_[i].addr, addr, sizeof(bonds_[i].addr)) == 0 && bonds_[i].name[0]) {
+      if (strncmp(bonds_[i].addr, lookup, sizeof(bonds_[i].addr)) == 0 && bonds_[i].name[0]) {
         resolved = bonds_[i].name;
         break;
       }
     }
   }
+  char resolvedName[sizeof(connName_)] = {};
+  if (resolved) {
+    strncpy(resolvedName, resolved, sizeof(resolvedName) - 1);
+  }
   connName_[0] = '\0';
   if (resolved) {
-    strncpy(connName_, resolved, sizeof(connName_) - 1);
+    strncpy(connName_, resolvedName, sizeof(connName_) - 1);
+    connName_[sizeof(connName_) - 1] = '\0';
+  } else if (identityAddr && identityAddr[0]) {
+    strncpy(connName_, identityAddr, sizeof(connName_) - 1);
     connName_[sizeof(connName_) - 1] = '\0';
   } else if (addr) {
     strncpy(connName_, addr, sizeof(connName_) - 1);
     connName_[sizeof(connName_) - 1] = '\0';
   }
 
-  // Persist the pairing if new.
-  if (addr) {
-    bool known = false;
+  // Persist the NimBLE identity address, not a temporary OTA address. This
+  // keeps resolvable-private-address reconnects attached to the existing bond.
+  const char* canonicalAddr = identityAddr && identityAddr[0] ? identityAddr : addr;
+  const uint8_t canonicalType = identityAddr && identityAddr[0] ? identityType : type;
+  if (canonicalAddr) {
+    int knownIndex = -1;
     for (uint8_t i = 0; i < bondCount_; ++i) {
-      if (strncmp(bonds_[i].addr, addr, sizeof(bonds_[i].addr)) == 0) {
-        if (resolved && strcmp(bonds_[i].name, resolved) != 0) {
-          strncpy(bonds_[i].name, resolved, sizeof(bonds_[i].name) - 1);
-          bonds_[i].name[sizeof(bonds_[i].name) - 1] = '\0';
-          bonds_[i].addrType = type;
-          persistBonds();
-        }
-        known = true;
+      if ((addr && strncmp(bonds_[i].addr, addr, sizeof(bonds_[i].addr)) == 0) ||
+          strncmp(bonds_[i].addr, canonicalAddr, sizeof(bonds_[i].addr)) == 0 ||
+          (resolvedName[0] && strcmp(bonds_[i].name, resolvedName) == 0)) {
+        knownIndex = i;
         break;
       }
     }
-    if (!known && bondCount_ < kMaxBonds) {
+    bool needsPersist = false;
+    if (knownIndex >= 0) {
+      PairedHidDevice& b = bonds_[knownIndex];
+      if (strncmp(b.addr, canonicalAddr, sizeof(b.addr)) != 0) {
+        strncpy(b.addr, canonicalAddr, sizeof(b.addr) - 1);
+        b.addr[sizeof(b.addr) - 1] = '\0';
+        needsPersist = true;
+      }
+      if (b.addrType != canonicalType) {
+        b.addrType = canonicalType;
+        needsPersist = true;
+      }
+      if (resolvedName[0] && strcmp(b.name, resolvedName) != 0) {
+        strncpy(b.name, resolvedName, sizeof(b.name) - 1);
+        b.name[sizeof(b.name) - 1] = '\0';
+        needsPersist = true;
+      }
+      if (needsPersist) persistBonds();
+    } else if (bondCount_ < kMaxBonds) {
       PairedHidDevice& b = bonds_[bondCount_++];
-      strncpy(b.addr, addr, sizeof(b.addr) - 1);
+      strncpy(b.addr, canonicalAddr, sizeof(b.addr) - 1);
       b.addr[sizeof(b.addr) - 1] = '\0';
       b.name[0] = '\0';
-      if (resolved) {
-        strncpy(b.name, resolved, sizeof(b.name) - 1);
+      if (resolvedName[0]) {
+        strncpy(b.name, resolvedName, sizeof(b.name) - 1);
         b.name[sizeof(b.name) - 1] = '\0';
       }
-      b.addrType = type;
+      b.addrType = canonicalType;
       persistBonds();
     }
   }
@@ -956,6 +1267,7 @@ void BleKeyboardHost::onLinkUp(const char* addr, const char* name, uint8_t type)
 void BleKeyboardHost::onLinkDown() {
   connected_ = false;
   connecting_ = false;
+  resetPresetState();
   portENTER_CRITICAL(&g_mux);
   heldUsage_ = 0;
   portEXIT_CRITICAL(&g_mux);
@@ -964,10 +1276,20 @@ void BleKeyboardHost::onLinkDown() {
 void BleKeyboardHost::onConnectFailed(const char* reason) {
   connected_ = false;
   connecting_ = false;
+  resetPresetState();
   portENTER_CRITICAL(&g_mux);
   strncpy(connectFailure_, reason && reason[0] ? reason : "Connection failed", sizeof(connectFailure_) - 1);
   connectFailure_[sizeof(connectFailure_) - 1] = '\0';
   connectFailed_ = true;
+  heldUsage_ = 0;
+  portEXIT_CRITICAL(&g_mux);
+}
+
+void BleKeyboardHost::onConnectionDeferred() {
+  connecting_ = false;
+  pairingPasskeyReady_ = false;
+  resetPresetState();
+  portENTER_CRITICAL(&g_mux);
   heldUsage_ = 0;
   portEXIT_CRITICAL(&g_mux);
 }
@@ -1055,16 +1377,24 @@ const PairedHidDevice& BleKeyboardHost::paired(uint8_t) const {
 }
 void BleKeyboardHost::forget(const char*) {}
 bool BleKeyboardHost::popKey(KeyEvent&) { return false; }
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+bool BleKeyboardHost::popRawReport(RawReportDiagnostic&) { return false; }
+void BleKeyboardHost::clearRawReports() {}
+#endif
 void BleKeyboardHost::onScanResultIngest(const char*, const char*, int, uint8_t, bool, bool) {}
-void BleKeyboardHost::onReportIngest(const uint8_t*, size_t) {}
-void BleKeyboardHost::onLinkUp(const char*, const char*, uint8_t) {}
+void BleKeyboardHost::onReportIngest(const uint8_t*, size_t, uint8_t) {}
+void BleKeyboardHost::onLinkUp(const char*, const char*, uint8_t, const char*, uint8_t) {}
 void BleKeyboardHost::onLinkDown() {}
 void BleKeyboardHost::onConnectFailed(const char*) {}
+void BleKeyboardHost::onConnectionDeferred() {}
 bool BleKeyboardHost::takeConnectFailure(char*, size_t) { return false; }
 void BleKeyboardHost::onPairingPasskey(uint32_t) {}
 bool BleKeyboardHost::takePairingPasskey(uint32_t&) { return false; }
 void BleKeyboardHost::enqueue(const KeyEvent&) {}
 void BleKeyboardHost::emitUsage(uint8_t, uint8_t) {}
+void BleKeyboardHost::emitSpecial(SpecialKey) {}
+void BleKeyboardHost::resetPresetState() {}
+void BleKeyboardHost::processYiserReport(const uint8_t*, size_t) {}
 void BleKeyboardHost::persistBonds() {}
 void BleKeyboardHost::loadBonds() {}
 

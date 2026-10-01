@@ -23,6 +23,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef FREEINK_BLE_HID_RAW_DIAGNOSTICS
+#define FREEINK_BLE_HID_RAW_DIAGNOSTICS 0
+#endif
+
 namespace freeink {
 
 // Non-character keys an editor/UI cares about. Printable keys arrive as `ch`.
@@ -43,6 +47,14 @@ enum class SpecialKey : uint8_t {
   PageDown,
 };
 
+// Hardware interpretation only. The preset emits the same SpecialKey values
+// as an ordinary HID keyboard; Nooir remains responsible for mapping those
+// logical inputs to the current activity's behavior.
+enum class InputPreset : uint8_t {
+  GenericHid = 0,
+  YiserJ6Ring = 1,
+};
+
 // One decoded key press (or auto-repeat). `pressed` is always true today — the
 // host emits on the press edge and synthesizes repeats while a key is held; key
 // releases are tracked internally for repeat but not surfaced.
@@ -53,6 +65,35 @@ struct KeyEvent {
   SpecialKey special = SpecialKey::None;
   bool pressed = true;
 };
+
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+// Fixed-size diagnostic snapshot copied at the notification boundary. The
+// payload is intentionally bounded: the Yiser-style reports under study are
+// short, while an explicit truncation bit keeps longer reports honest.
+struct RawReportDiagnostic {
+  static constexpr uint8_t kMaxPayloadBytes = 64;
+
+  uint32_t sequence = 0;
+  uint32_t uptimeMs = 0;
+  uint16_t deltaMs = 0;
+  uint8_t source = 0;       // 1 = Report characteristic, 2 = Boot keyboard characteristic
+  uint8_t reportType = 1;   // subscribed HID input report
+  uint8_t reportId = 0xFF;  // 0xFF = not identifiable from the raw notification
+  uint8_t state = 0;        // decoder-observable flags, assigned after raw copy
+  uint16_t length = 0;      // original payload length, saturated at 65535
+  uint8_t storedLength = 0; // bytes copied into payload[]
+  bool truncated = false;
+  uint8_t payload[kMaxPayloadBytes] = {};
+};
+
+enum RawReportState : uint8_t {
+  RAW_STATE_KEYBOARD_SHAPED = 1 << 0,
+  RAW_STATE_GENERIC_PATH = 1 << 1,
+  RAW_STATE_PRESS_EDGE = 1 << 2,
+  RAW_STATE_RELEASE_EDGE = 1 << 3,
+  RAW_STATE_AXIS_CANDIDATE = 1 << 4,
+};
+#endif
 
 // A BLE device seen during a scan.
 struct DiscoveredDevice {
@@ -78,6 +119,7 @@ class BleKeyboardHost {
   static constexpr uint8_t kMaxDiscovered = 24;
   static constexpr uint8_t kMaxBonds = 4;
   static constexpr uint8_t kKeyQueueLen = 16;
+  using ConnectionPermissionCallback = bool (*)();
 
   static BleKeyboardHost& getInstance();
 
@@ -85,6 +127,18 @@ class BleKeyboardHost {
   // pairing list. Safe to call once. Returns false if BLE init failed or the
   // capability is compiled out.
   bool begin(const char* hostName = "FreeInk");
+
+  // The application may deny connection-producing operations while retaining
+  // the generic host's bounded lifecycle and bond state. The callback is
+  // intentionally a plain function pointer so the SDK does not depend on
+  // application classes or allocate in the BLE path.
+  void setConnectionPermissionCallback(ConnectionPermissionCallback callback) { connectionPermission_ = callback; }
+  bool connectionPermitted() const { return !connectionPermission_ || connectionPermission_(); }
+
+  void setInputPreset(InputPreset preset) {
+    inputPreset_ = preset == InputPreset::YiserJ6Ring ? preset : InputPreset::GenericHid;
+  }
+  InputPreset inputPreset() const { return inputPreset_; }
 
   // Fully tear down the BLE stack: stop scanning, drop the link, delete the
   // connection task, and NimBLEDevice::deinit() so the NimBLE host + controller
@@ -132,19 +186,31 @@ class BleKeyboardHost {
   // Pop the next key event. Returns false when the queue is empty.
   bool popKey(KeyEvent& out);
 
+#if FREEINK_BLE_HID_RAW_DIAGNOSTICS
+  // Diagnostics-only raw notification queue. It is drained by the Nooir main
+  // loop; normal input decoding and mapping do not consume or depend on it.
+  bool popRawReport(RawReportDiagnostic& out);
+  void clearRawReports();
+#endif
+
   // --- Internal: called by the NimBLE backend (not for app use). These keep the
   // public header free of NimBLE types — the .cpp translates BLE objects into
   // these plain calls. -------------------------------------------------------
   void onScanResultIngest(const char* addr, const char* name, int rssi, uint8_t type, bool hid, bool connectable);
-  void onReportIngest(const uint8_t* data, size_t len);
-  void onLinkUp(const char* addr, const char* name, uint8_t type);
+  void onReportIngest(const uint8_t* data, size_t len, uint8_t source = 0);
+  void onLinkUp(const char* addr, const char* name, uint8_t type, const char* identityAddr = nullptr,
+                uint8_t identityType = 0);
   void onLinkDown();
   void onConnectFailed(const char* reason);
+  void onConnectionDeferred();
   void onPairingPasskey(uint32_t passkey);
 
  private:
   void enqueue(const KeyEvent& ev);    // ring push (spinlock-guarded)
   void emitUsage(uint8_t usage, uint8_t mods);  // translate + enqueue
+  void emitSpecial(SpecialKey special);
+  void resetPresetState();
+  void processYiserReport(const uint8_t* data, size_t len);
   void persistBonds();
   void loadBonds();
   BleKeyboardHost() = default;
@@ -170,6 +236,8 @@ class BleKeyboardHost {
   volatile bool pairingPasskeyReady_ = false;
   volatile bool scanning_ = false;
   bool begun_ = false;
+  InputPreset inputPreset_ = InputPreset::GenericHid;
+  ConnectionPermissionCallback connectionPermission_ = nullptr;
 
   // Key auto-repeat: HID delivers one report per state change, so holding a key
   // (backspace, arrows) only sends a single press. The backend records the held
