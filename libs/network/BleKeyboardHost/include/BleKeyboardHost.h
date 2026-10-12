@@ -55,15 +55,20 @@ enum class InputPreset : uint8_t {
   YiserJ6Ring = 1,
 };
 
-// One decoded key press (or auto-repeat). `pressed` is always true today — the
-// host emits on the press edge and synthesizes repeats while a key is held; key
-// releases are tracked internally for repeat but not surfaced.
+// The phase is kept separate from the decoded key identity so consumers can
+// preserve press/release/hold semantics without treating every HID report as a
+// new click. Hold is represented by a Press followed by no Release while the
+// key remains down; Repeat is reserved for host-generated or device-generated
+// repeat events.
+enum class KeyPhase : uint8_t { Press = 0, Repeat, Release };
+
 struct KeyEvent {
   char ch = 0;                          // printable ASCII, or 0 for a special key
   uint8_t keycode = 0;                  // raw HID usage id
   uint8_t mods = 0;                     // HID modifier bitmask (ctrl/shift/alt/gui)
   SpecialKey special = SpecialKey::None;
   bool pressed = true;
+  KeyPhase phase = KeyPhase::Press;
 };
 
 #if FREEINK_BLE_HID_RAW_DIAGNOSTICS
@@ -148,7 +153,8 @@ class BleKeyboardHost {
   // Must run at normal CPU frequency (controller deinit), like begin().
   void end();
 
-  // Pump per main-loop iteration: drives auto-reconnect and key auto-repeat.
+  // Pump per main-loop iteration: drives auto-reconnect and bounded stale-key
+  // release. The application owns continuous navigation repeat.
   // Cheap; never blocks.
   void poll();
 
@@ -186,6 +192,11 @@ class BleKeyboardHost {
   // Pop the next key event. Returns false when the queue is empty.
   bool popKey(KeyEvent& out);
 
+  // Clear queued input and decoder/held-key state at an intentional lifecycle
+  // boundary. This is input state only; it does not alter bonds or connection
+  // admission and is safe to call even when the host is already stopped.
+  void resetInputState();
+
 #if FREEINK_BLE_HID_RAW_DIAGNOSTICS
   // Diagnostics-only raw notification queue. It is drained by the Nooir main
   // loop; normal input decoding and mapping do not consume or depend on it.
@@ -207,8 +218,8 @@ class BleKeyboardHost {
 
  private:
   void enqueue(const KeyEvent& ev);    // ring push (spinlock-guarded)
-  void emitUsage(uint8_t usage, uint8_t mods);  // translate + enqueue
-  void emitSpecial(SpecialKey special);
+  void emitUsage(uint8_t usage, uint8_t mods, KeyPhase phase = KeyPhase::Press);  // translate + enqueue
+  void emitSpecial(SpecialKey special, KeyPhase phase = KeyPhase::Press);
   void resetPresetState();
   void processYiserReport(const uint8_t* data, size_t len);
   void persistBonds();
@@ -239,9 +250,9 @@ class BleKeyboardHost {
   InputPreset inputPreset_ = InputPreset::GenericHid;
   ConnectionPermissionCallback connectionPermission_ = nullptr;
 
-  // Key auto-repeat: HID delivers one report per state change, so holding a key
-  // (backspace, arrows) only sends a single press. The backend records the held
-  // usage here and poll() synthesizes repeats after an initial delay.
+  // Held-key tracking: HID delivers one report per state change, so the backend
+  // keeps the current identity until a release report or the bounded stale
+  // boundary. Continuous UI navigation remains owned by the application.
   volatile uint8_t heldUsage_ = 0;
   volatile uint8_t heldMods_ = 0;
   volatile uint32_t heldSince_ = 0;

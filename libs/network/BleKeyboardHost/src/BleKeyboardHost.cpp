@@ -58,7 +58,8 @@ void lifecycleStage(const char* stage) {
 #if FREEINK_BLE_HID_LIFECYCLE_DIAGNOSTICS
   if (!stage || (std::strcmp(stage, "pre_init") != 0 && std::strcmp(stage, "nimble_init") != 0 &&
                  std::strcmp(stage, "client_created") != 0 && std::strcmp(stage, "host_ready") != 0 &&
-                 std::strcmp(stage, "connect_start") != 0 && std::strcmp(stage, "link_connected") != 0 &&
+                 std::strcmp(stage, "connect_start") != 0 && std::strcmp(stage, "connect_join_inflight") != 0 &&
+                 std::strcmp(stage, "link_connected") != 0 &&
                  std::strcmp(stage, "hid_service_found") != 0 && std::strcmp(stage, "security_ready") != 0 &&
                  std::strcmp(stage, "hid_input_ready") != 0 && std::strcmp(stage, "scan_start") != 0))
     return;
@@ -95,6 +96,7 @@ bool g_hasKeyboardPage = false;
 bool g_hasConsumerPage = false;
 uint8_t g_preferredByteIndex = 0xFF;  // byte the report map suggests holds the code
 uint8_t g_lastGenericCode = 0;        // last non-zero code seen on the generic path
+uint8_t g_genericActiveUsage = 0;     // decoded identity whose release is still pending
 volatile uint32_t g_lastReportMs = 0;  // millis() of the last HID notification (stale-release)
 
 enum class YiserGesture : uint8_t { Idle, PendingConfirm, Vertical, Left, Right, AwaitRelease };
@@ -103,6 +105,7 @@ struct YiserGestureState {
   uint8_t step = 0;
   uint16_t firstAxis = 0;
   uint32_t startedMs = 0;
+  SpecialKey emittedSpecial = SpecialKey::None;
 };
 YiserGestureState g_yiserGesture;
 constexpr uint32_t kYiserGestureTimeoutMs = 350;
@@ -342,7 +345,12 @@ void connTaskFn(void*) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     doConnect(g_targetAddr, g_targetType);
+    // Release the claim only after the complete blocking connect/discover
+    // sequence has unwound.  The claim itself is taken synchronously by
+    // connect(), before this notification is queued.
+    portENTER_CRITICAL(&g_mux);
     g_connecting = false;
+    portEXIT_CRITICAL(&g_mux);
   }
 }
 
@@ -509,6 +517,7 @@ bool BleKeyboardHost::begin(const char* hostName) {
 
 void BleKeyboardHost::end() {
   if (!begun_) return;
+  resetInputState();
   begun_ = false;
   lifecycleStage("host_end_pre");
 
@@ -561,6 +570,7 @@ void BleKeyboardHost::end() {
   lifecycleStage("host_end_post");
   g_connecting = false;
   g_lastGenericCode = 0;
+  g_genericActiveUsage = 0;
   g_lastReportMs = 0;
   resetPresetState();
 
@@ -575,6 +585,26 @@ void BleKeyboardHost::end() {
   portEXIT_CRITICAL(&g_mux);
 }
 
+void BleKeyboardHost::resetInputState() {
+  // This is intentionally independent of NimBLE teardown. Reader/Web/lifecycle
+  // boundaries can stop the host after a report has already been queued; clear
+  // the queue and every decoder latch so the next connection cannot replay a
+  // stale click, repeat, or partial Yiser burst.
+  portENTER_CRITICAL(&g_mux);
+  ringHead_ = 0;
+  ringTail_ = 0;
+  heldUsage_ = 0;
+  heldMods_ = 0;
+  heldSince_ = 0;
+  lastRepeat_ = 0;
+  portEXIT_CRITICAL(&g_mux);
+  memset(prevKeys_, 0, sizeof(prevKeys_));
+  g_lastGenericCode = 0;
+  g_genericActiveUsage = 0;
+  g_lastReportMs = 0;
+  resetPresetState();
+}
+
 void BleKeyboardHost::poll() {
   if (!begun_) return;
 
@@ -582,19 +612,37 @@ void BleKeyboardHost::poll() {
   scanning_ = NimBLEDevice::getScan()->isScanning();
 
   // Held-key release. Page-turner remotes stream a held key (and many omit a clean
-  // release frame), so we do NOT synthesize host-side auto-repeat — that turned one
-  // tap into dozens of page turns. Instead, when reports stop arriving, age the held
-  // key / last generic code out so one physical press == one event and the next press
-  // (even of the same button) re-triggers. Covers both the keyboard and generic paths.
+  // release frame), so age the held key / generic identity out at a bounded stale
+  // boundary. Surface the release before clearing the latches so the application
+  // can close its held state without inventing another click.
   portENTER_CRITICAL(&g_mux);
   const uint8_t held = heldUsage_;
+  const uint8_t heldMods = heldMods_;
   portEXIT_CRITICAL(&g_mux);
-  if ((held != 0 || g_lastGenericCode != 0) && (millis() - g_lastReportMs) > kReleaseTimeoutMs) {
+  const uint32_t now = millis();
+  if ((held != 0 || g_lastGenericCode != 0 || g_yiserGesture.kind == YiserGesture::AwaitRelease) &&
+      (now - g_lastReportMs) > kReleaseTimeoutMs) {
+    bool releasedHeld = false;
+    for (const uint8_t key : prevKeys_) {
+      if (key == 0 || key == 0x01) continue;
+      emitUsage(key, heldMods, KeyPhase::Release);
+      releasedHeld = true;
+    }
+    if (held != 0 && !releasedHeld) emitUsage(held, heldMods, KeyPhase::Release);
+    if (g_genericActiveUsage != 0) {
+      emitUsage(g_genericActiveUsage, 0, KeyPhase::Release);
+      g_genericActiveUsage = 0;
+    }
+    if (g_yiserGesture.kind == YiserGesture::AwaitRelease &&
+        g_yiserGesture.emittedSpecial != SpecialKey::None) {
+      emitSpecial(g_yiserGesture.emittedSpecial, KeyPhase::Release);
+    }
     portENTER_CRITICAL(&g_mux);
     heldUsage_ = 0;
     portEXIT_CRITICAL(&g_mux);
     memset(prevKeys_, 0, sizeof(prevKeys_));
     g_lastGenericCode = 0;
+    resetPresetState();
   }
 
   // Auto-reconnect to a bonded HID peripheral.
@@ -675,7 +723,7 @@ void BleKeyboardHost::releaseScanResults() {
 
 // --- Connection --------------------------------------------------------------
 bool BleKeyboardHost::connect(const char* addr) {
-  if (!begun_ || !addr || g_connecting) return false;
+  if (!begun_ || !addr) return false;
   if (connectionPermission_ && !connectionPermission_()) return false;
 
   uint8_t type = 0;
@@ -695,6 +743,16 @@ bool BleKeyboardHost::connect(const char* addr) {
     }
   }
 
+  // UI/lifecycle reevaluation and poll() can arrive on different contexts.
+  // Claim the single worker synchronously before notifying it; checking only
+  // the member flag and setting g_connecting afterwards left a small window in
+  // which both callers emitted connect_start.
+  portENTER_CRITICAL(&g_mux);
+  if (connected_ || connecting_ || g_connecting) {
+    portEXIT_CRITICAL(&g_mux);
+    lifecycleStage("connect_join_inflight");
+    return false;
+  }
   strncpy(g_targetAddr, addr, sizeof(g_targetAddr) - 1);
   g_targetAddr[sizeof(g_targetAddr) - 1] = '\0';
   g_targetType = type;
@@ -704,7 +762,18 @@ bool BleKeyboardHost::connect(const char* addr) {
   connectFailed_ = false;
   pairingPasskeyReady_ = false;
   connectFailure_[0] = '\0';
-  if (g_connTask) xTaskNotifyGive(g_connTask);
+  TaskHandle_t connTask = g_connTask;
+  portEXIT_CRITICAL(&g_mux);
+
+  if (connTask) {
+    xTaskNotifyGive(connTask);
+  } else {
+    // Do not leave an in-flight claim stranded if the host is being torn down.
+    portENTER_CRITICAL(&g_mux);
+    g_connecting = false;
+    connecting_ = false;
+    portEXIT_CRITICAL(&g_mux);
+  }
   return true;
 }
 
@@ -776,7 +845,7 @@ void BleKeyboardHost::enqueue(const KeyEvent& ev) {
   portEXIT_CRITICAL(&g_mux);
 }
 
-void BleKeyboardHost::emitUsage(uint8_t usage, uint8_t mods) {
+void BleKeyboardHost::emitUsage(const uint8_t usage, const uint8_t mods, const KeyPhase phase) {
   if (usage == 0) return;
   char ch;
   SpecialKey special;
@@ -789,15 +858,17 @@ void BleKeyboardHost::emitUsage(uint8_t usage, uint8_t mods) {
   ev.keycode = usage;
   ev.mods = mods;
   ev.special = special;
-  ev.pressed = true;
+  ev.pressed = phase != KeyPhase::Release;
+  ev.phase = phase;
   enqueue(ev);
 }
 
-void BleKeyboardHost::emitSpecial(const SpecialKey special) {
+void BleKeyboardHost::emitSpecial(const SpecialKey special, const KeyPhase phase) {
   if (special == SpecialKey::None) return;
   KeyEvent ev;
   ev.special = special;
-  ev.pressed = true;
+  ev.pressed = phase != KeyPhase::Release;
+  ev.phase = phase;
   enqueue(ev);
 }
 
@@ -814,6 +885,9 @@ void BleKeyboardHost::processYiserReport(const uint8_t* data, const size_t len) 
   // short timeout so a partial burst cannot remain active indefinitely.
   if (g_yiserGesture.kind != YiserGesture::Idle && g_yiserGesture.kind != YiserGesture::PendingConfirm &&
       now - g_yiserGesture.startedMs > kYiserGestureTimeoutMs) {
+    if (g_yiserGesture.emittedSpecial != SpecialKey::None) {
+      emitSpecial(g_yiserGesture.emittedSpecial, KeyPhase::Release);
+    }
     resetPresetState();
   }
 
@@ -831,16 +905,25 @@ void BleKeyboardHost::processYiserReport(const uint8_t* data, const size_t len) 
     case YiserGesture::Idle:
       if (!pressed) return;
       if (code == 0xA4) {
-        emitSpecial(SpecialKey::Escape);  // Back
+        g_yiserGesture.kind = YiserGesture::AwaitRelease;
+        g_yiserGesture.emittedSpecial = SpecialKey::Escape;  // Back
+        g_yiserGesture.startedMs = now;
+        emitSpecial(g_yiserGesture.emittedSpecial, KeyPhase::Press);
         return;
       }
       if (code == 0x2C) {
-        // Confirm is delayed until the matching release. The same 0x2C code is
-        // the first and fourth member of the directional ring gestures.
+        // The standalone Confirm report has a stable 0x01F4 axis value. Emit
+        // its press immediately, but retain PendingConfirm until the matching
+        // release so a long hold is not mistaken for a direction and the
+        // shared 0x2C directional prefix remains unambiguous.
         g_yiserGesture.kind = YiserGesture::PendingConfirm;
         g_yiserGesture.step = 1;
         g_yiserGesture.firstAxis = axis;
         g_yiserGesture.startedMs = now;
+        if (axis == 0x01F4) {
+          g_yiserGesture.emittedSpecial = SpecialKey::Enter;
+          emitSpecial(g_yiserGesture.emittedSpecial, KeyPhase::Press);
+        }
         return;
       }
       if (code == kLeft[0]) {
@@ -858,8 +941,19 @@ void BleKeyboardHost::processYiserReport(const uint8_t* data, const size_t len) 
 
     case YiserGesture::PendingConfirm:
       if (!pressed) {
-        if (code == 0x2C && axis == 0x01F4) emitSpecial(SpecialKey::Enter);  // Confirm
+        if (code == 0x2C && axis == 0x01F4) {
+          if (g_yiserGesture.emittedSpecial == SpecialKey::None) {
+            g_yiserGesture.emittedSpecial = SpecialKey::Enter;
+            emitSpecial(g_yiserGesture.emittedSpecial, KeyPhase::Press);
+          }
+          emitSpecial(g_yiserGesture.emittedSpecial, KeyPhase::Release);
+        }
         resetPresetState();
+        return;
+      }
+      if (code == 0x2C && axis == 0x01F4 && g_yiserGesture.emittedSpecial == SpecialKey::Enter) {
+        // A held Confirm may repeat the same report. Keep the recognizer alive
+        // and let the eventual matching release close the logical key.
         return;
       }
       // Directional bursts never use the standalone Confirm axis value.
@@ -879,7 +973,8 @@ void BleKeyboardHost::processYiserReport(const uint8_t* data, const size_t len) 
       }
       ++g_yiserGesture.step;
       if (g_yiserGesture.step == sizeof(kVertical)) {
-        emitSpecial(g_yiserGesture.firstAxis >= 0x0200 ? SpecialKey::Down : SpecialKey::Up);
+        g_yiserGesture.emittedSpecial = g_yiserGesture.firstAxis >= 0x0200 ? SpecialKey::Down : SpecialKey::Up;
+        emitSpecial(g_yiserGesture.emittedSpecial, KeyPhase::Press);
         g_yiserGesture.kind = YiserGesture::AwaitRelease;
       }
       return;
@@ -891,7 +986,8 @@ void BleKeyboardHost::processYiserReport(const uint8_t* data, const size_t len) 
       }
       ++g_yiserGesture.step;
       if (g_yiserGesture.step == sizeof(kLeft)) {
-        emitSpecial(SpecialKey::Left);
+        g_yiserGesture.emittedSpecial = SpecialKey::Left;
+        emitSpecial(g_yiserGesture.emittedSpecial, KeyPhase::Press);
         g_yiserGesture.kind = YiserGesture::AwaitRelease;
       }
       return;
@@ -903,13 +999,19 @@ void BleKeyboardHost::processYiserReport(const uint8_t* data, const size_t len) 
       }
       ++g_yiserGesture.step;
       if (g_yiserGesture.step == sizeof(kRight)) {
-        emitSpecial(SpecialKey::Right);
+        g_yiserGesture.emittedSpecial = SpecialKey::Right;
+        emitSpecial(g_yiserGesture.emittedSpecial, KeyPhase::Press);
         g_yiserGesture.kind = YiserGesture::AwaitRelease;
       }
       return;
 
     case YiserGesture::AwaitRelease:
-      if (!pressed) resetPresetState();
+      if (!pressed) {
+        if (g_yiserGesture.emittedSpecial != SpecialKey::None) {
+          emitSpecial(g_yiserGesture.emittedSpecial, KeyPhase::Release);
+        }
+        resetPresetState();
+      }
       return;
   }
 }
@@ -998,7 +1100,27 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len, const uint
         }
       }
       if (!wasDown) {
-        emitUsage(k, mod);
+        emitUsage(k, mod, KeyPhase::Press);
+        emittedKb = true;
+      }
+    }
+
+    // Surface releases for keys that disappeared from the six-key report. The
+    // previous implementation only cleared its internal repeat latch, which
+    // left the application unable to distinguish a real release from a stale
+    // connection/lifecycle boundary.
+    for (int i = 0; i < 6; ++i) {
+      const uint8_t oldKey = prevKeys_[i];
+      if (oldKey == 0 || oldKey == 0x01) continue;
+      bool stillDown = false;
+      for (int j = 0; j < 6; ++j) {
+        if (keys[j] == oldKey) {
+          stillDown = true;
+          break;
+        }
+      }
+      if (!stillDown) {
+        emitUsage(oldKey, mod, KeyPhase::Release);
         emittedKb = true;
       }
     }
@@ -1054,7 +1176,10 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len, const uint
     if (pressEdge) raw.state |= RAW_STATE_PRESS_EDGE;
     if (codeIdx == 0 && n >= 5) raw.state |= RAW_STATE_AXIS_CANDIDATE;
 #endif
-    if (codeIdx == 0 && n >= 5) {
+    if (code == 0 && g_genericActiveUsage != 0) {
+      emitUsage(g_genericActiveUsage, 0, KeyPhase::Release);
+      g_genericActiveUsage = 0;
+    } else if (codeIdx == 0 && n >= 5) {
       // Gamepad/axis-pair mode (ino gamebrick T): byte 0 is a status byte whose
       // bit0 is "pressed" (0x13 press -> 0x12 release), bytes 1-4 are two 16-bit
       // LE axes centered at ~2000. Every button raises the same pressed bit; the
@@ -1079,13 +1204,22 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len, const uint
         };
         const uint8_t zonePair = zone(axis1) * 3 + zone(axis2);
         if (zonePair != 4) {  // 4 = both centered: nothing to bind
-          emitUsage(0x40 + zonePair, 0);
+          const uint8_t usage = static_cast<uint8_t>(0x40 + zonePair);
+          if (g_genericActiveUsage != 0 && g_genericActiveUsage != usage) {
+            emitUsage(g_genericActiveUsage, 0, KeyPhase::Release);
+          }
+          emitUsage(usage, 0, KeyPhase::Press);
+          g_genericActiveUsage = usage;
         }
       }
     } else if (pressEdge) {
       // Value-coded remotes (e.g. "01 00 00" press, all-zero release): the code
       // byte IS the identity; emit on the press edge as before.
-      emitUsage(code, 0);
+      if (g_genericActiveUsage != 0 && g_genericActiveUsage != code) {
+        emitUsage(g_genericActiveUsage, 0, KeyPhase::Release);
+      }
+      emitUsage(code, 0, KeyPhase::Press);
+      g_genericActiveUsage = code;
     }
     g_lastGenericCode = code;
   } else if (emittedKb) {
@@ -1267,31 +1401,24 @@ void BleKeyboardHost::onLinkUp(const char* addr, const char* name, uint8_t type,
 void BleKeyboardHost::onLinkDown() {
   connected_ = false;
   connecting_ = false;
-  resetPresetState();
-  portENTER_CRITICAL(&g_mux);
-  heldUsage_ = 0;
-  portEXIT_CRITICAL(&g_mux);
+  resetInputState();
 }
 
 void BleKeyboardHost::onConnectFailed(const char* reason) {
   connected_ = false;
   connecting_ = false;
-  resetPresetState();
   portENTER_CRITICAL(&g_mux);
   strncpy(connectFailure_, reason && reason[0] ? reason : "Connection failed", sizeof(connectFailure_) - 1);
   connectFailure_[sizeof(connectFailure_) - 1] = '\0';
   connectFailed_ = true;
-  heldUsage_ = 0;
   portEXIT_CRITICAL(&g_mux);
+  resetInputState();
 }
 
 void BleKeyboardHost::onConnectionDeferred() {
   connecting_ = false;
   pairingPasskeyReady_ = false;
-  resetPresetState();
-  portENTER_CRITICAL(&g_mux);
-  heldUsage_ = 0;
-  portEXIT_CRITICAL(&g_mux);
+  resetInputState();
 }
 
 bool BleKeyboardHost::takeConnectFailure(char* out, size_t outLen) {
@@ -1377,6 +1504,7 @@ const PairedHidDevice& BleKeyboardHost::paired(uint8_t) const {
 }
 void BleKeyboardHost::forget(const char*) {}
 bool BleKeyboardHost::popKey(KeyEvent&) { return false; }
+void BleKeyboardHost::resetInputState() {}
 #if FREEINK_BLE_HID_RAW_DIAGNOSTICS
 bool BleKeyboardHost::popRawReport(RawReportDiagnostic&) { return false; }
 void BleKeyboardHost::clearRawReports() {}
@@ -1391,8 +1519,8 @@ bool BleKeyboardHost::takeConnectFailure(char*, size_t) { return false; }
 void BleKeyboardHost::onPairingPasskey(uint32_t) {}
 bool BleKeyboardHost::takePairingPasskey(uint32_t&) { return false; }
 void BleKeyboardHost::enqueue(const KeyEvent&) {}
-void BleKeyboardHost::emitUsage(uint8_t, uint8_t) {}
-void BleKeyboardHost::emitSpecial(SpecialKey) {}
+void BleKeyboardHost::emitUsage(uint8_t, uint8_t, KeyPhase) {}
+void BleKeyboardHost::emitSpecial(SpecialKey, KeyPhase) {}
 void BleKeyboardHost::resetPresetState() {}
 void BleKeyboardHost::processYiserReport(const uint8_t*, size_t) {}
 void BleKeyboardHost::persistBonds() {}
